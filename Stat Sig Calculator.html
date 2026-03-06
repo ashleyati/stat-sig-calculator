@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>A/B Testing Suite</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet"/>
+  <style>
+    body { background: #f9fafb; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useRef, useEffect } = React;
+
+    function normCDF(x) {
+      const t = 1/(1+0.2316419*Math.abs(x));
+      const d = 0.3989422820*Math.exp(-x*x/2);
+      const p = d*t*(0.3193815+t*(-0.3565638+t*(1.7814779+t*(-1.8212560+t*1.3302744))));
+      return x>0?1-p:p;
+    }
+    function normPDF(x){return Math.exp(-0.5*x*x)/Math.sqrt(2*Math.PI);}
+    function normINV(p){
+      const a=[2.515517,0.802853,0.010328],b=[1.432788,0.189269,0.001308];
+      const t=p<0.5?Math.sqrt(-2*Math.log(p)):Math.sqrt(-2*Math.log(1-p));
+      const num=a[0]+t*(a[1]+t*a[2]),den=1+t*(b[0]+t*(b[1]+t*b[2]));
+      return p<0.5?-(t-num/den):t-num/den;
+    }
+    function zTest(c1,n1,c2,n2){
+      const p1=c1/n1,p2=c2/n2,pp=(c1+c2)/(n1+n2);
+      const se=Math.sqrt(pp*(1-pp)*(1/n1+1/n2));
+      if(!se)return null;
+      const z=(p1-p2)/se,pVal=2*(1-normCDF(Math.abs(z)));
+      const ci=1.96*Math.sqrt(p1*(1-p1)/n1+p2*(1-p2)/n2);
+      return{p1,p2,z,pVal,uplift:(p1-p2)/p2*100,ci};
+    }
+    function sampleSize(base,mde,alpha=0.05,power=0.8){
+      const za=normINV(1-alpha/2),zb=normINV(power);
+      const p1=base,p2=base*(1+mde/100);
+      return Math.ceil(2*(za+zb)**2*(p1*(1-p1)+p2*(1-p2))/(p1-p2)**2);
+    }
+
+    const TIPS={
+      "Relative Uplift":"How much better (or worse) Variant B performs vs. A as a % of A's rate.",
+      "Z-score":"Standard deviations from zero. Larger absolute value = more surprising under H₀.",
+      "p-value":"Probability of seeing this difference by chance if there's truly no effect.",
+      "95% CI (diff)":"Range that would contain the true difference 95% of the time.",
+      "Confidence":"1 − p-value as %. Higher = more confident the difference is real.",
+    };
+    const COLORS=["#6366f1","#10b981","#f59e0b","#ef4444","#ec4899"];
+    const LABELS=["A","B","C","D","E"];
+
+    function Info({tip}){
+      const [s,setS]=useState(false);
+      return(
+        <span className="relative inline-flex items-center ml-1">
+          <button onMouseEnter={()=>setS(true)} onMouseLeave={()=>setS(false)}
+            className="w-4 h-4 rounded-full bg-gray-200 text-gray-500 text-xs font-bold flex items-center justify-center hover:bg-indigo-200 hover:text-indigo-700 transition-colors">i</button>
+          {s&&<span style={{position:"absolute",bottom:"1.5rem",left:"50%",transform:"translateX(-50%)",width:"13rem",background:"#1f2937",color:"#fff",fontSize:"0.75rem",borderRadius:"0.5rem",padding:"0.5rem 0.75rem",boxShadow:"0 4px 6px rgba(0,0,0,0.1)",pointerEvents:"none",zIndex:50}}>
+            {tip}<span style={{position:"absolute",top:"100%",left:"50%",transform:"translateX(-50%)",borderWidth:"4px",borderStyle:"solid",borderColor:"#1f2937 transparent transparent transparent"}}/>
+          </span>}
+        </span>
+      );
+    }
+    function Field({label,value,onChange,prefix,step="1",min="0"}){
+      return(
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-semibold text-gray-500 uppercase tracking-wide">{label}</label>
+          <div className="flex items-center border border-gray-200 rounded-lg overflow-hidden" style={{boxShadow:"0 0 0 0px #6366f1"}}>
+            {prefix&&<span className="px-2 bg-gray-50 text-gray-400 text-sm border-r border-gray-200">{prefix}</span>}
+            <input type="number" min={min} step={step} value={value} onChange={e=>onChange(e.target.value)}
+              className="px-3 py-2 text-sm w-full focus:outline-none"/>
+          </div>
+        </div>
+      );
+    }
+    function StatCard({k,v}){
+      return(
+        <div className="bg-white rounded-lg px-3 py-2 border border-gray-100">
+          <div className="text-xs text-gray-400 flex items-center">{k}{TIPS[k]&&<Info tip={TIPS[k]}/>}</div>
+          <div className="font-semibold text-gray-800 mt-1">{v}</div>
+        </div>
+      );
+    }
+    function Badge({sig}){
+      return <span className={`px-2 py-1 rounded-full text-xs font-bold whitespace-nowrap ${sig?"bg-green-100 text-green-700":"bg-red-100 text-red-600"}`}>
+        {sig?"✓ Sig":"✗ Not Sig"}
+      </span>;
+    }
+
+    function BellCurves({result}){
+      const ref=useRef();
+      useEffect(()=>{
+        if(!result||!ref.current)return;
+        const canvas=ref.current,ctx=canvas.getContext("2d");
+        const W=canvas.width,H=canvas.height;
+        ctx.clearRect(0,0,W,H);
+        const{p1,p2}=result;
+        const se1=Math.sqrt(p1*(1-p1)/5000),se2=Math.sqrt(p2*(1-p2)/5000);
+        const xMin=Math.min(p1,p2)-4*Math.max(se1,se2),xMax=Math.max(p1,p2)+4*Math.max(se1,se2);
+        const toX=v=>(v-xMin)/(xMax-xMin)*(W-40)+20;
+        const steps=200;let maxY=0;
+        for(let i=0;i<=steps;i++){
+          const x=xMin+i/steps*(xMax-xMin);
+          maxY=Math.max(maxY,normPDF((x-p1)/se1)/se1,normPDF((x-p2)/se2)/se2);
+        }
+        const toY=v=>H-10-v/maxY*(H-30);
+        const pts1=[],pts2=[];
+        for(let i=0;i<=steps;i++){
+          const x=xMin+i/steps*(xMax-xMin);
+          pts1.push([toX(x),toY(normPDF((x-p1)/se1)/se1)]);
+          pts2.push([toX(x),toY(normPDF((x-p2)/se2)/se2)]);
+        }
+        const draw=(pts,color,fill)=>{
+          ctx.beginPath();ctx.moveTo(pts[0][0],pts[0][1]);
+          pts.forEach(([x,y])=>ctx.lineTo(x,y));
+          ctx.strokeStyle=color;ctx.lineWidth=2;ctx.stroke();
+          ctx.lineTo(pts[pts.length-1][0],H);ctx.lineTo(pts[0][0],H);ctx.closePath();
+          ctx.fillStyle=fill;ctx.fill();
+        };
+        draw(pts2,"#94a3b8","rgba(148,163,184,0.2)");
+        draw(pts1,"#6366f1","rgba(99,102,241,0.2)");
+        [[p1,"#6366f1"],[p2,"#94a3b8"]].forEach(([mu,c])=>{
+          ctx.beginPath();ctx.moveTo(toX(mu),10);ctx.lineTo(toX(mu),H-10);
+          ctx.setLineDash([4,4]);ctx.strokeStyle=c;ctx.lineWidth=1.5;ctx.stroke();
+          ctx.setLineDash([]);
+        });
+      },[result]);
+      return(
+        <div className="space-y-1">
+          <p className="text-xs text-gray-400 font-medium">Sampling distributions</p>
+          <canvas ref={ref} width={520} height={120} className="w-full rounded-lg bg-gray-50 border border-gray-100"/>
+          <div className="flex gap-4 text-xs text-gray-500">
+            <span className="flex items-center gap-1"><span style={{display:"inline-block",width:"12px",height:"4px",borderRadius:"2px",background:"#6366f1"}}/>Variant A</span>
+            <span className="flex items-center gap-1"><span style={{display:"inline-block",width:"12px",height:"4px",borderRadius:"2px",background:"#94a3b8"}}/>Variant B</span>
+          </div>
+        </div>
+      );
+    }
+
+    function RevenueImpactAB({result}){
+      const [rev,setRev]=useState(50),[daily,setDaily]=useState(1000);
+      const d=Number(daily)||1000,r=Number(rev)||0;
+      const annualA=result.p1*d*365*r,annualB=result.p2*d*365*r,diff=annualB-annualA;
+      const fmt=v=>"$"+Math.abs(v).toLocaleString(undefined,{maximumFractionDigits:0});
+      const pct=Math.min(Math.abs(diff)/(Math.max(annualA,annualB)||1)*100,100);
+      return(
+        <div className="bg-gray-50 rounded-xl p-4 border border-gray-100 space-y-3">
+          <p className="font-semibold text-gray-700 text-sm">💰 Revenue Impact</p>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Revenue / conversion ($)" value={rev} onChange={setRev} prefix="$" step="0.01"/>
+            <Field label="Daily visitors" value={daily} onChange={setDaily}/>
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-center text-sm">
+            {[["Variant A (annual)",fmt(annualA),"text-indigo-600"],["Variant B (annual)",fmt(annualB),"text-gray-500"],
+              [diff>=0?"Projected gain":"Projected loss",fmt(diff),diff>=0?"text-green-600":"text-red-500"]
+            ].map(([l,v,c])=>(
+              <div key={l} className="bg-white rounded-lg py-2 px-1 border border-gray-100">
+                <div className="text-xs text-gray-400">{l}</div>
+                <div className={`font-bold text-base mt-1 ${c}`}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div>
+            <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+              <div className={`h-2 rounded-full ${diff>=0?"bg-green-400":"bg-red-400"}`} style={{width:`${pct}%`}}/>
+            </div>
+            <p className="text-xs text-gray-400 mt-1">{diff>=0?"Variant B could generate":"Variant B could lose"} {fmt(diff)}/year vs control</p>
+          </div>
+        </div>
+      );
+    }
+
+    function RevenueImpactMulti({rates,labels,colors}){
+      const [rev,setRev]=useState(50),[daily,setDaily]=useState(1000);
+      const d=Number(daily)||1000,r=Number(rev)||0;
+      const annual=rates.map(rate=>rate*d*365*r);
+      const fmt=v=>"$"+Math.abs(v).toLocaleString(undefined,{maximumFractionDigits:0});
+      return(
+        <div className="bg-gray-50 rounded-xl p-4 border border-gray-100 space-y-3">
+          <p className="font-semibold text-gray-700 text-sm">💰 Revenue Impact</p>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Revenue / conversion ($)" value={rev} onChange={setRev} prefix="$" step="0.01"/>
+            <Field label="Daily visitors" value={daily} onChange={setDaily}/>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-gray-400 border-b border-gray-200">
+                  <th className="text-left py-1 pr-2">Variant</th>
+                  <th className="text-center py-1 pr-2">Annual Revenue</th>
+                  <th className="text-right py-1">vs Control</th>
+                </tr>
+              </thead>
+              <tbody>
+                {annual.map((a,i)=>{
+                  const diff=a-annual[0];
+                  return(
+                    <tr key={i} className="border-b border-gray-100">
+                      <td className="py-1 pr-2 font-bold" style={{color:colors[i]}}><span style={{display:"inline-block",width:"1rem"}}></span>{labels[i]}</td>
+                      <td className="text-center pr-2 font-semibold text-gray-800">{fmt(a)}</td>
+                      <td className={`text-right font-semibold ${i===0?"text-gray-400":diff>=0?"text-green-600":"text-red-500"}`}>
+                        {i===0?"—":(diff>=0?"+":"-")+fmt(diff)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-gray-400">Annual projections at {Number(daily).toLocaleString()} visitors/day and ${Number(rev).toFixed(2)}/conversion. Differences shown vs A (control).</p>
+        </div>
+      );
+    }
+
+    function ABSummary({result,sig,alpha}){
+      const{p1,p2,uplift,pVal}=result;
+      const conf=((1-pVal)*100).toFixed(1);
+      const aRate=(p1*100).toFixed(2),bRate=(p2*100).toFixed(2);
+      if(!sig)return(
+        <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 text-sm text-yellow-800">
+          <p className="font-bold">📊 No clear winner yet</p>
+          <p className="mt-1">Variant A ({aRate}%) vs B ({bRate}%) show a {Math.abs(uplift).toFixed(2)}% relative difference, but only {conf}% confidence — could be chance. Collect more data.</p>
+        </div>
+      );
+      const win=p2>p1?"B":"A",los=win==="B"?"A":"B";
+      const wRate=win==="B"?bRate:aRate,lRate=win==="B"?aRate:bRate;
+      return(
+        <div className={`border rounded-xl p-4 text-sm space-y-1 ${win==="B"?"bg-green-50 border-green-200 text-green-800":"bg-blue-50 border-blue-200 text-blue-800"}`}>
+          <p className="font-bold text-base">{win==="B"?"🏆":"🔄"} Variant {win} wins</p>
+          <p>Variant {win} ({wRate}%) beats Variant {los} ({lRate}%) by <strong>{Math.abs(uplift).toFixed(2)}% relatively</strong> with <strong>{conf}% confidence</strong>.</p>
+          <p className="text-xs opacity-70 pt-1">{win==="A"?"Consider keeping Variant A (control) as your baseline.":"Ship Variant B — the data supports it."}</p>
+        </div>
+      );
+    }
+
+    function SampleTab(){
+      const [base,setBase]=useState(5),[mde,setMde]=useState(10);
+      const [alpha,setAlpha]=useState(0.05),[power,setPower]=useState(80);
+      const [daily,setDaily]=useState(1000);
+      const b=Number(base)/100,m=Number(mde),a=Number(alpha),pw=Number(power)/100,d=Number(daily)||1;
+      const n=useMemo(()=>{
+        if(!b||!m||b<=0||b>=1||m===0)return null;
+        try{return sampleSize(b,m,a,pw);}catch{return null;}
+      },[b,m,a,pw]);
+      const days=n?Math.ceil((n*2)/d):null;
+      const barW=days?Math.min(days/90*100,100):0;
+      return(
+        <div className="space-y-5">
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="Baseline conversion (%)" value={base} onChange={setBase} step="0.1" min="0.1"/>
+            <Field label="Min. detectable effect (%)" value={mde} onChange={setMde} step="0.5"/>
+            <Field label="Daily visitors" value={daily} onChange={setDaily}/>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Statistical Power</label>
+              <div className="flex gap-2 mt-1">
+                {[80,90,95].map(p=>(
+                  <button key={p} onClick={()=>setPower(p)}
+                    className={`flex-1 py-2 rounded-lg text-xs font-semibold border transition-colors ${power===p?"bg-indigo-600 text-white border-indigo-600":"border-gray-200 text-gray-500"}`}>
+                    {p}%
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Significance</span><Info tip="The significance threshold. If the p-value falls below this, the result is statistically significant. 5% is the industry standard — meaning you accept a 5% chance the result is a false positive."/>
+            {[0.01,0.05,0.10].map(a2=>(
+              <button key={a2} onClick={()=>setAlpha(a2)}
+                className={`px-3 py-1 rounded-full text-xs font-semibold border transition-colors ${alpha===a2?"bg-indigo-600 text-white border-indigo-600":"border-gray-200 text-gray-500"}`}>
+                {(a2*100).toFixed(0)}%
+              </button>
+            ))}
+          </div>
+          {n?(
+            <div className="space-y-3">
+              <div className="grid grid-cols-3 gap-3 text-center">
+                {[["Per variant",n.toLocaleString(),"indigo"],["Total visitors",(n*2).toLocaleString(),"indigo"],["Est. days",days,"green"]
+                ].map(([l,v,c])=>(
+                  <div key={l} className={`bg-${c}-50 border border-${c}-100 rounded-xl py-4`}>
+                    <div className="text-xs text-gray-400">{l}</div>
+                    <div className={`font-bold text-2xl text-${c}-600 mt-1`}>{v}</div>
+                  </div>
+                ))}
+              </div>
+              <div>
+                <div className="flex justify-between text-xs text-gray-400 mb-1">
+                  <span>Duration estimate</span><span>{days} day{days!==1?"s":""} at {Number(daily).toLocaleString()}/day</span>
+                </div>
+                <div className="h-3 bg-gray-200 rounded-full overflow-hidden">
+                  <div className="h-3 bg-indigo-400 rounded-full" style={{width:`${barW}%`}}/>
+                </div>
+                <p className="text-xs text-gray-400 mt-1">{days<=14?"✅ Short test — feasible.":days<=30?"⚠️ About a month — plan accordingly.":"🔴 Long test. Consider raising your MDE or increasing traffic."}</p>
+              </div>
+              <div className="bg-gray-50 rounded-xl p-4 border border-gray-100 text-sm space-y-3">
+                <p className="font-semibold text-gray-700">What this means</p>
+                <p className="text-gray-500">You need <strong>{n.toLocaleString()} visitors per variant</strong> to reliably detect a <strong>{mde}% improvement</strong> over your current <strong>{base}% conversion rate</strong>. At your traffic level, that's about <strong>{days} days</strong>.</p>
+                <div className="space-y-1 text-gray-500">
+                  <p>✅ Baseline rate: <strong>{base}%</strong></p>
+                  <p>✅ Improvement to detect: <strong>+{mde}% ({base}% → {(Number(base)*(1+Number(mde)/100)).toFixed(2)}%)</strong></p>
+                  <p>✅ Chance of catching it: <strong>{power}%</strong></p>
+                  <p>👥 Visitors needed: <strong>{n.toLocaleString()} per variant</strong></p>
+                  <p>⏱ Estimated time: <strong>~{days} days</strong></p>
+                </div>
+              </div>
+            </div>
+          ):<p className="text-center text-gray-400 text-sm py-4">Enter valid parameters above.</p>}
+        </div>
+      );
+    }
+
+    function ABTab(){
+      const [c1,setC1]=useState(520),[n1,setN1]=useState(5000);
+      const [c2,setC2]=useState(480),[n2,setN2]=useState(5000);
+      const [alpha,setAlpha]=useState(0.05);
+      const result=useMemo(()=>{
+        const v=[c1,n1,c2,n2].map(Number);
+        if(v.some(x=>isNaN(x)||x<=0)||v[0]>v[1]||v[2]>v[3])return null;
+        return zTest(v[0],v[1],v[2],v[3]);
+      },[c1,n1,c2,n2]);
+      const sig=result&&result.pVal<Number(alpha);
+      return(
+        <div className="space-y-5">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="col-span-2 text-xs font-bold text-gray-500 uppercase tracking-widest">Variant A (Control)</div>
+            <Field label="Conversions" value={c1} onChange={setC1}/>
+            <Field label="Visitors" value={n1} onChange={setN1}/>
+            <div className="col-span-2 text-xs font-bold text-indigo-600 uppercase tracking-widest">Variant B</div>
+            <Field label="Conversions" value={c2} onChange={setC2}/>
+            <Field label="Visitors" value={n2} onChange={setN2}/>
+          </div>
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Significance</span><Info tip="The significance threshold. If the p-value falls below this, the result is statistically significant. 5% is the industry standard — meaning you accept a 5% chance the result is a false positive."/>
+            {[0.01,0.05,0.10].map(a=>(
+              <button key={a} onClick={()=>setAlpha(a)}
+                className={`px-3 py-1 rounded-full text-xs font-semibold border transition-colors ${Number(alpha)===a?"bg-indigo-600 text-white border-indigo-600":"border-gray-200 text-gray-500"}`}>
+                {(a*100).toFixed(0)}%
+              </button>
+            ))}
+          </div>
+          {result?(
+            <div className="space-y-4">
+              <BellCurves result={result}/>
+              <div className="bg-gray-50 rounded-xl p-4 border border-gray-100 space-y-4">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-gray-700">Stats</span>
+                  <span className={`px-3 py-1 rounded-full text-xs font-bold ${sig?"bg-green-100 text-green-700":"bg-red-100 text-red-600"}`}>{sig?"✓ Significant":"✗ Not Significant"}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  {[["Conversion A",`${(result.p1*100).toFixed(2)}%`],["Conversion B",`${(result.p2*100).toFixed(2)}%`],
+                    ["Relative Uplift",`${result.uplift>=0?"+":""}${result.uplift.toFixed(2)}%`],["Z-score",result.z.toFixed(4)],
+                    ["p-value",result.pVal<0.0001?"< 0.0001":result.pVal.toFixed(4)],["95% CI (diff)",`±${(result.ci*100).toFixed(3)}%`],
+                    ["Confidence",`${((1-result.pVal)*100).toFixed(1)}%`],["α threshold",`${(Number(alpha)*100).toFixed(0)}%`]
+                  ].map(([k,v])=><StatCard key={k} k={k} v={v}/>)}
+                </div>
+                <div>
+                  <div className="flex justify-between text-xs text-gray-400 mb-1">
+                    <span>p = {result.pVal<0.0001?"< 0.0001":result.pVal.toFixed(4)}</span><span>α = {alpha}</span>
+                  </div>
+                  <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                    <div className={`h-2 rounded-full ${sig?"bg-green-500":"bg-red-400"}`} style={{width:`${Math.min(result.pVal/Number(alpha),1)*100}%`}}/>
+                  </div>
+                  <p className="text-xs text-gray-400 mt-1">{sig?"p-value below α — reject H₀.":"p-value above α — fail to reject H₀."}</p>
+                </div>
+              </div>
+              <RevenueImpactAB result={result}/>
+              <ABSummary result={result} sig={sig} alpha={alpha}/>
+            </div>
+          ):<p className="text-center text-gray-400 text-sm py-4">Enter valid values to see results.</p>}
+        </div>
+      );
+    }
+
+    function MultiTab(){
+      const [variants,setVariants]=useState([{c:520,n:5000},{c:480,n:5000},{c:510,n:5000}]);
+      const [alpha,setAlpha]=useState(0.05);
+      const addV=()=>variants.length<5&&setVariants([...variants,{c:100,n:1000}]);
+      const removeV=i=>variants.length>2&&setVariants(variants.filter((_,j)=>j!==i));
+      const upd=(i,k,v)=>setVariants(variants.map((vt,j)=>j===i?{...vt,[k]:v}:vt));
+      const correctedAlpha=alpha/((variants.length*(variants.length-1))/2);
+      const rates=variants.map(v=>Number(v.c)/Number(v.n));
+      const valid=variants.every(v=>Number(v.c)>0&&Number(v.n)>0&&Number(v.c)<=Number(v.n));
+      const bestIdx=valid?rates.indexOf(Math.max(...rates)):0;
+      const barMax=valid?Math.max(...rates):0.2;
+      const pairs=valid?variants.slice(1).map((_,i)=>zTest(Number(variants[i+1].c),Number(variants[i+1].n),Number(variants[0].c),Number(variants[0].n))):[];
+      return(
+        <div className="space-y-5">
+          <div className="space-y-3">
+            {variants.map((v,i)=>(
+              <div key={i} className="bg-gray-50 rounded-xl p-3 border border-gray-100">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold uppercase tracking-widest" style={{color:COLORS[i]}}>Variant {LABELS[i]}{i===0?" (Control)":""}</span>
+                  {i>=2&&<button onClick={()=>removeV(i)} className="text-gray-300 hover:text-red-400 text-lg leading-none">×</button>}
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Conversions" value={v.c} onChange={val=>upd(i,"c",val)}/>
+                  <Field label="Visitors" value={v.n} onChange={val=>upd(i,"n",val)}/>
+                </div>
+              </div>
+            ))}
+            {variants.length<5&&<button onClick={addV} className="w-full py-2 border-2 border-dashed border-gray-200 rounded-xl text-gray-400 text-sm hover:border-indigo-300 hover:text-indigo-400 transition-colors">+ Add Variant</button>}
+            <p className="text-xs text-gray-400">You can test up to 5 variants (A–E). Bonferroni correction is applied automatically to account for multiple comparisons.</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Significance</span><Info tip="The significance threshold. If the p-value falls below this, the result is statistically significant. 5% is the industry standard — meaning you accept a 5% chance the result is a false positive."/>
+            {[0.01,0.05,0.10].map(a=>(
+              <button key={a} onClick={()=>setAlpha(a)}
+                className={`px-3 py-1 rounded-full text-xs font-semibold border transition-colors ${alpha===a?"bg-indigo-600 text-white border-indigo-600":"border-gray-200 text-gray-500"}`}>
+                {(a*100).toFixed(0)}%
+              </button>
+            ))}
+            <span className="text-xs text-gray-400">(corrected: {(correctedAlpha*100).toFixed(2)}%)</span>
+          </div>
+          {valid&&(
+            <div className="space-y-4">
+              <div className="bg-gray-50 rounded-xl p-4 border border-gray-100">
+                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Conversion Rates</p>
+                <div className="space-y-3">
+                  {variants.map((_,i)=>{
+                    const rate=rates[i],pct=(rate/barMax*100);
+                    return(
+                      <div key={i} className="flex items-center gap-3">
+                        <span className="text-xs font-bold flex-shrink-0" style={{color:COLORS[i],width:"2rem"}}>
+                          <span style={{display:"inline-block",width:"1rem"}}>{i===bestIdx?"👑":""}</span>{LABELS[i]}
+                        </span>
+                        <div className="flex-1 bg-gray-200 rounded-full h-5 relative overflow-hidden">
+                          <div className="h-5 rounded-full flex items-center justify-end pr-2" style={{width:`${pct}%`,background:COLORS[i]}}>
+                            {pct>20&&<span className="text-white text-xs font-semibold">{(rate*100).toFixed(2)}%</span>}
+                          </div>
+                          {pct<=20&&<span className="absolute text-xs font-semibold text-gray-600 whitespace-nowrap" style={{left:`${pct}%`,paddingLeft:"6px",top:"3px"}}>{(rate*100).toFixed(2)}%</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="bg-gray-50 rounded-xl p-4 border border-gray-100">
+                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Stats vs Control (A) — Bonferroni corrected</p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs" style={{tableLayout:"fixed"}}>
+                    <thead>
+                      <tr className="text-gray-400 border-b border-gray-200">
+                        <th className="text-left py-1 w-1/6">Variant</th>
+                        <th className="text-right py-1 w-1/6">Conv. Rate</th>
+                        <th className="text-right py-1 w-1/6">Uplift</th>
+                        <th className="text-right py-1 w-1/6">Z-score</th>
+                        <th className="text-right py-1 w-1/6">p-value</th>
+                        <th className="text-right py-1 w-1/6">Result</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr className="border-b border-gray-100">
+                        <td className="py-1 font-bold" style={{color:COLORS[0]}}><span style={{display:"inline-block",width:"1rem"}}></span>A</td>
+                        <td className="text-right font-semibold">{(rates[0]*100).toFixed(2)}%</td>
+                        <td className="text-right text-gray-400">—</td>
+                        <td className="text-right text-gray-400">—</td>
+                        <td className="text-right text-gray-400">—</td>
+                        <td className="text-right text-gray-400">baseline</td>
+                      </tr>
+                      {pairs.map((r,i)=>{
+                        if(!r)return null;
+                        const sig=r.pVal<correctedAlpha;
+                        return(
+                          <tr key={i} className="border-b border-gray-100">
+                            <td className="py-1 font-bold" style={{color:COLORS[i+1]}}><span style={{display:"inline-block",width:"1rem"}}></span>{LABELS[i+1]}</td>
+                            <td className="text-right font-semibold">{(rates[i+1]*100).toFixed(2)}%</td>
+                            <td className={`text-right font-semibold ${r.uplift>=0?"text-green-600":"text-red-500"}`}>{r.uplift>=0?"+":""}{r.uplift.toFixed(1)}%</td>
+                            <td className="text-right text-gray-600">{r.z.toFixed(2)}</td>
+                            <td className="text-right text-gray-600">{r.pVal<0.001?"< 0.001":r.pVal.toFixed(3)}</td>
+                            <td className="text-right"><Badge sig={sig}/></td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <RevenueImpactMulti rates={rates} labels={LABELS} colors={COLORS}/>
+              <div className={`border rounded-xl p-4 text-sm ${rates[bestIdx]>rates[0]?"bg-green-50 border-green-200 text-green-800":"bg-blue-50 border-blue-200 text-blue-800"}`}>
+                <p className="font-bold">📊 Summary</p>
+                <p className="mt-1">
+                  <strong>Variant {LABELS[bestIdx]}</strong> leads with <strong>{(rates[bestIdx]*100).toFixed(2)}%</strong> conversion.
+                  {pairs[bestIdx-1]&&pairs[bestIdx-1].pVal<correctedAlpha
+                    ?` Statistically significant vs control after Bonferroni correction (α = ${(correctedAlpha*100).toFixed(2)}%). Consider shipping Variant ${LABELS[bestIdx]}.`
+                    :` However, no variant has reached significance vs control yet — collect more data.`}
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const TABS=[{id:"sample",label:"Sample Size"},{id:"ab",label:"A/B Test"},{id:"multi",label:"Multi-Variant"}];
+    function App(){
+      const [tab,setTab]=useState("sample");
+      return(
+        <div style={{minHeight:"100vh",background:"#f9fafb",display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"1rem"}}>
+          <div style={{width:"100%",maxWidth:"640px",background:"#fff",borderRadius:"1rem",boxShadow:"0 1px 3px rgba(0,0,0,0.1)",border:"1px solid #f3f4f6",overflow:"hidden"}}>
+            <div style={{background:"#4f46e5",padding:"1rem 1.5rem"}}>
+              <h1 style={{color:"#fff",fontWeight:"700",fontSize:"1.125rem",margin:0}}>Stat Sig Calculator</h1>
+              <p style={{color:"#c7d2fe",fontSize:"0.75rem",marginTop:"0.25rem"}}>Estimate sample size. Test for significance. Identify your winner.</p>
+            </div>
+            <div style={{display:"flex",borderBottom:"1px solid #f3f4f6"}}>
+              {TABS.map(t=>(
+                <button key={t.id} onClick={()=>setTab(t.id)}
+                  style={{flex:1,padding:"0.75rem",fontSize:"0.875rem",fontWeight:"600",border:"none",borderBottom:`2px solid ${tab===t.id?"#4f46e5":"transparent"}`,color:tab===t.id?"#4f46e5":"#9ca3af",background:"#fff",cursor:"pointer"}}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+            <div style={{padding:"1.5rem"}}>
+              {tab==="sample"&&<SampleTab/>}
+              {tab==="ab"&&<ABTab/>}
+              {tab==="multi"&&<MultiTab/>}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App/>, document.getElementById("root"));
+  </script>
+</body>
+</html>
